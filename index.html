@@ -46,6 +46,7 @@
       <div id="auth-error" class="auth-feedback" aria-live="polite"></div>
       <button id="btn-login" class="btn btn-primary" type="submit">Entrar</button>
     </form>
+    <div id="auth-noaccess" class="setup-guide" hidden><b>Conta sem acesso à equipe.</b><p>Seu login existe, mas não foi autorizado para ver os registros compartilhados. Peça ao administrador para incluir sua conta em <code>bathroom_team_members</code> no Supabase.</p><button type="button" id="btn-noaccess-signout" class="btn">Sair desta conta</button></div>
     <p style="font-size:11px;margin:20px 0 0">Acesso privado. Cadastre usuários autorizados em <b>Supabase → Authentication → Users</b>.</p>
   </section>
 </div>
@@ -61,8 +62,8 @@
       <button class="nav-btn" data-tab="reports"><svg><use href="#i-chart"/></svg><span>Relatórios</span></button>
     </nav>
     <div class="sidebar-bottom">
-      <div class="side-card"><div class="side-icon">☁</div><b>Sincronizado com Supabase</b><p>Seus registros são armazenados na nuvem, com acesso restrito à sua conta.</p><div class="side-tools"><button data-action="export-json">Backup JSON</button><button data-action="export-csv">Relatório CSV</button></div></div>
-      <p class="sidebar-foot">PAUSA • SUPABASE 2.0</p>
+      <div class="side-card"><div class="side-icon">☁</div><b>Sincronizado com Supabase</b><p>Pessoas e contagens compartilhadas com todos os membros autorizados da equipe.</p><div class="side-tools"><button data-action="export-json">Backup JSON</button><button data-action="export-csv">Relatório CSV</button></div></div>
+      <p class="sidebar-foot">PAUSA • EQUIPE 3.0</p>
     </div>
   </aside>
   <main class="main">

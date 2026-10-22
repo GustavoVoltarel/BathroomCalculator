@@ -9,15 +9,16 @@
                    !cfg.supabasePublishableKey.includes('COLE_AQUI');
   const sb=configured && window.supabase?.createClient(cfg.supabaseUrl, cfg.supabasePublishableKey,
     {auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}});
-  let currentUser=null, refreshing=false, writing=false;
-  const cloudPerson=p=>({id:p.id,name:p.name,color:p.color,createdAt:Date.parse(p.created_at)});
-  const cloudSession=s=>({id:s.id,personId:s.person_id,startAt:Date.parse(s.started_at),endAt:s.ended_at?Date.parse(s.ended_at):null});
+  let currentUser=null, refreshing=false, writing=false, realtimeChannel=null, remoteRefreshTimer=null, refreshPending=false;
+  const cloudPerson=p=>({id:p.id,name:p.name,color:p.color,ownerId:p.owner_id,createdAt:Date.parse(p.created_at)});
+  const cloudSession=s=>({id:s.id,personId:s.person_id,startAt:Date.parse(s.started_at),endAt:s.ended_at?Date.parse(s.ended_at):null,startedBy:s.started_by,endedBy:s.ended_by});
   function setSync(label, isError=false){const el=$('#sync-status');if(el){el.textContent=label;el.style.color=isError?'#ff9aac':'#9cdbc9';}}
   function errorMessage(error){
     const s=String(error?.message||error||'Falha na conexão.');
     if(/duplicate key|23505/.test(s))return 'Este registro já existe ou esta pessoa já está com o cronômetro ativo.';
     if(/foreign key|23503/.test(s))return 'O registro associado não foi encontrado.';
-    if(/row.level.security|permission denied|42501/.test(s))return 'Acesso negado. Confira as políticas RLS e o login.';
+    if(/row.level.security|permission denied|42501/.test(s))return 'Acesso negado. Confira a migração SQL e se sua conta está autorizada na equipe.';
+    if(/bathroom_team_members|42P01/.test(s))return 'A tabela de equipe não existe. Execute o SQL de migração no Supabase.';
     if(/Failed to fetch|fetch failed|NetworkError/.test(s))return 'Não foi possível conectar ao Supabase. Verifique sua internet e a configuração.';
     return s;
   }
@@ -31,20 +32,65 @@
     }
     throw new Error('Volume de registros excedeu o limite de carregamento.');
   }
+  function scheduleRemoteRefresh(){
+    if(!currentUser)return;
+    clearTimeout(remoteRefreshTimer);
+    remoteRefreshTimer=setTimeout(()=>refreshData(true),350);
+  }
+  function stopRealtime(){
+    clearTimeout(remoteRefreshTimer);remoteRefreshTimer=null;
+    if(realtimeChannel&&sb)sb.removeChannel(realtimeChannel);
+    realtimeChannel=null;
+  }
+  function connectRealtime(){
+    if(!sb||!currentUser||realtimeChannel)return;
+    realtimeChannel=sb.channel('pausa-equipe-'+currentUser.id)
+      .on('postgres_changes',{event:'*',schema:'public',table:'bathroom_people'},scheduleRemoteRefresh)
+      .on('postgres_changes',{event:'*',schema:'public',table:'bathroom_sessions'},scheduleRemoteRefresh)
+      .subscribe(status=>{
+        if(!currentUser)return;
+        if(status==='SUBSCRIBED'){
+          setSync('● Equipe ao vivo');
+          scheduleRemoteRefresh();
+        } else if(['CHANNEL_ERROR','TIMED_OUT','CLOSED'].includes(status)){
+          setSync('Atualização a cada 30s',true);
+        }
+      });
+  }
+  function showNoAccess(){
+    stopRealtime();
+    $('#app-shell').hidden=true;
+    $('#auth-shell').hidden=false;
+    $('#auth-setup').hidden=true;
+    $('#form-login').hidden=true;
+    $('#auth-noaccess').hidden=false;
+    $('#auth-error').textContent='';
+  }
+  async function checkMembership(userId){
+    const {data,error}=await sb.from('bathroom_team_members')
+      .select('user_id').eq('user_id',userId).maybeSingle();
+    if(error)throw error;
+    return !!data;
+  }
   async function refreshData(silent=false){
-    if(!sb||!currentUser||refreshing||writing)return;
+    if(!sb||!currentUser)return;
+    if(refreshing||writing){refreshPending=true;return;}
     if(silent && modal && (modal.type==='add'||modal.type==='edit'))return;
     const originalId=currentUser.id;
     refreshing=true;
     if(!silent)setSync('Sincronizando…');
     try{
+      if(!await checkMembership(originalId)){
+        if(currentUser?.id===originalId)showNoAccess();
+        return;
+      }
       const [people,sessions]=await Promise.all([pageAll('bathroom_people'),pageAll('bathroom_sessions')]);
       if(currentUser?.id!==originalId)return;
       store={people:people.map(cloudPerson),sessions:sessions.map(cloudSession)};
-      setSync('Sincronizado');
+      setSync(realtimeChannel?.state==='joined'?'● Equipe ao vivo':'Sincronizado');
       render();
     }catch(error){setSync('Erro de conexão',true);if(!silent)toast(errorMessage(error));}
-    finally{refreshing=false;}
+    finally{refreshing=false;if(refreshPending){refreshPending=false;scheduleRemoteRefresh();}}
   }
   async function mutate(callback, success){
     if(writing||!currentUser)return;
@@ -56,21 +102,26 @@
       await callback();
       succeeded=true;modal=null;toast(success);
     }catch(error){toast(errorMessage(error));setSync('Falha ao salvar',true);}
-    finally{writing=false;document.querySelectorAll('[data-action]').forEach(b=>b.disabled=false);}
+    finally{writing=false;document.querySelectorAll('[data-action]').forEach(b=>b.disabled=false);if(refreshPending){refreshPending=false;scheduleRemoteRefresh();}}
     if(succeeded)await refreshData();
   }
   async function viewSignedIn(user){
     if(!user)return;
     if(currentUser?.id===user.id && !$('#app-shell').hidden)return;
     currentUser=user;
+    $('#auth-noaccess').hidden=true;
+    $('#form-login').hidden=false;
     $('#auth-shell').hidden=true;
     $('#app-shell').hidden=false;
     $('#account-email').textContent=user.email||'Usuário';
     await refreshData();
+    if(currentUser?.id===user.id && !$('#app-shell').hidden)connectRealtime();
   }
   function viewSignedOut(){
+    stopRealtime();
     currentUser=null;store={people:[],sessions:[]};modal=null;
     $('#app-shell').hidden=true;$('#auth-shell').hidden=false;
+    $('#form-login').hidden=false;$('#auth-noaccess').hidden=true;
     $('#auth-error').textContent='';$('#login-password').value='';
     $('#content').innerHTML='';$('#modal-root').innerHTML='';
   }
@@ -104,6 +155,7 @@
   const initials=(name)=>name.trim().split(/\s+/).slice(0,2).map(x=>x[0]).join('').toLocaleUpperCase('pt-BR');
   let store={people:[],sessions:[]}, tab='overview', modal=null, searchPeople='',historyDate='',historyPerson='all',range='30',customFrom='',customTo='';
   const person=(id)=>store.people.find(p=>p.id===id);
+  const actorName=(id)=>!id?'Não informado':id===currentUser?.id?'Você':'Outro membro da equipe';
   const openSessions=()=>store.sessions.filter(s=>s.endAt===null);
   const activeSession=(id)=>store.sessions.find(s=>s.personId===id&&s.endAt===null);
   const ended=()=>store.sessions.filter(s=>Number.isFinite(s.endAt)&&s.endAt>=s.startAt);
@@ -157,12 +209,12 @@
     <div class="panel">${sectionHeader('Em andamento',active.length?`${active.length} ${active.length===1?'pessoa utilizando':'pessoas utilizando'} o cronômetro`:'Nenhum cronômetro ativo',`<button class="panel-link" data-tab="people">Ver pessoas →</button>`)}${active.length?active.map(s=>{const p=person(s.personId);if(!p)return '';return `<div class="live-person"><div class="identity">${avatar(p,true)}<div><div class="person-name">${esc(p.name)}</div><div class="person-sub"><span class="live-pill"><span class="live-dot"></span> Ativo</span></div></div></div><div style="text-align:right"><div class="live-clock" data-timer-person="${esc(p.id)}">${fmtTimer(Date.now()-s.startAt)}</div><button class="panel-link" data-action="stop" data-id="${esc(p.id)}" style="color:#da6070;margin-top:7px">Finalizar</button></div></div>`}).join(''):empty('Tudo em ordem','Quando alguém iniciar um cronômetro, ele aparecerá aqui.')}</div></div>
     <div class="panel" style="margin-bottom:20px">${sectionHeader('Contagem por pessoa','Inicie ou encerre uma contagem diretamente pelo cartão',`<button class="panel-link" data-tab="people">Gerenciar pessoas →</button>`)}${store.people.length?`<div class="people-grid">${store.people.map(personCard).join('')}</div>`:empty('Cadastre sua primeira pessoa','Os perfis permitem registrar e consultar o histórico de uso individual.',`<button class="btn btn-primary" data-action="add">${ICON('plus')} Cadastrar pessoa</button>`)}</div>
     <div class="panel">${sectionHeader('Últimas contagens finalizadas','Histórico das cinco atividades mais recentes',`<button class="panel-link" data-tab="history">Ver histórico completo →</button>`)}${sessionTable(cleanSessions().slice(0,5))}<p class="hint">As sessões em andamento entram nas estatísticas quando forem finalizadas. Contagens que atravessarem a meia-noite terão o tempo dividido entre os dias correspondentes.</p></div>`}
-  function sessionTable(list){if(!list.length)return '<div class="no-data">Nenhuma contagem finalizada ainda.</div>';return `<div class="table-wrap"><table><thead><tr><th>Pessoa</th><th>Data</th><th>Início</th><th>Fim</th><th>Duração</th></tr></thead><tbody>${list.map(s=>{const p=person(s.personId);if(!p)return '';return `<tr><td><div class="identity">${avatar(p,true)}<strong>${esc(p.name)}</strong></div></td><td>${dateLabel(fmtDateKey(s.startAt))}</td><td>${fmtTime(s.startAt)}</td><td>${fmtTime(s.endAt)}</td><td><span class="tag">${fmtDuration(s.endAt-s.startAt,true)}</span></td></tr>`}).join('')}</tbody></table></div>`}
+  function sessionTable(list){if(!list.length)return '<div class="no-data">Nenhuma contagem finalizada ainda.</div>';return `<div class="table-wrap"><table><thead><tr><th>Pessoa</th><th>Data</th><th>Início</th><th>Fim</th><th>Duração</th><th>Iniciou</th><th>Encerrou</th></tr></thead><tbody>${list.map(s=>{const p=person(s.personId);if(!p)return '';return `<tr><td><div class="identity">${avatar(p,true)}<strong>${esc(p.name)}</strong></div></td><td>${dateLabel(fmtDateKey(s.startAt))}</td><td>${fmtTime(s.startAt)}</td><td>${fmtTime(s.endAt)}</td><td><span class="tag">${fmtDuration(s.endAt-s.startAt,true)}</span></td><td><span class="muted">${esc(actorName(s.startedBy))}</span></td><td><span class="muted">${esc(actorName(s.endedBy))}</span></td></tr>`}).join('')}</tbody></table></div>`}
   function peopleView(){const people=store.people.filter(p=>p.name.toLocaleLowerCase('pt-BR').includes(searchPeople.toLocaleLowerCase('pt-BR')));return `<div class="page-head"><div><h1>Pessoas</h1><p class="page-sub">Cadastre pessoas, acompanhe sessões e acesse os perfis individuais.</p></div><button class="btn btn-primary" data-action="add">${ICON('plus')} Nova pessoa</button></div><div class="filters"><input class="field field-search" id="search-people" placeholder="Buscar por nome..." value="${esc(searchPeople)}" aria-label="Buscar pessoas"><span class="filters-end">${store.people.length} ${store.people.length===1?'pessoa cadastrada':'pessoas cadastradas'}</span></div><div class="panel">${people.length?`<div class="people-grid">${people.map(personCard).join('')}</div>`:empty(searchPeople?'Nenhum resultado':'Nenhuma pessoa cadastrada',searchPeople?'Tente buscar por outro nome.':'Adicione pessoas para começar a registrar o tempo de uso.',!searchPeople?`<button class="btn btn-primary" data-action="add">${ICON('plus')} Nova pessoa</button>`:'')}</div>`}
   function historyView(){const sessions=cleanSessions(),selected=[];for(const s of sessions){if(historyPerson!=='all'&&historyPerson!==s.personId)continue;for(const piece of parts(s)){if(historyDate&&piece.date!==historyDate)continue;selected.push(piece)}}selected.sort((a,b)=>b.from-a.from);const groups=new Map();for(const x of selected.slice(0,300)){if(!groups.has(x.date))groups.set(x.date,[]);groups.get(x.date).push(x)};
     return `<div class="page-head"><div><h1>Histórico de uso</h1><p class="page-sub">Todas as contagens concluídas, organizadas por dia e pessoa.</p></div><button class="btn" data-action="export-csv">${ICON('download')} Exportar CSV</button></div>
     <div class="panel"><div class="filters"><input class="field" id="history-date" type="date" value="${esc(historyDate)}" aria-label="Filtrar por dia"><select class="field field-select" id="history-person" aria-label="Filtrar por pessoa"><option value="all">Todas as pessoas</option>${store.people.map(p=>`<option value="${esc(p.id)}" ${historyPerson===p.id?'selected':''}>${esc(p.name)}</option>`).join('')}</select><button class="btn btn-small" data-action="clear-history">Limpar filtros</button><span class="filters-end">${selected.length} ${selected.length===1?'registro diário':'registros diários'}</span></div>
-    ${groups.size?[...groups.entries()].map(([date,rows])=>`<div class="history-day panel" style="box-shadow:none;padding:0"><div class="history-header"><div><h3>${esc(dateLabel(date,true))}</h3><span>${rows.reduce((acc,r)=>acc+(r.isStart?1:0),0)} ${rows.filter(r=>r.isStart).length===1?'uso iniciado':'usos iniciados'} no dia</span></div><span class="tag gray">${fmtDuration(rows.reduce((acc,r)=>acc+r.ms,0),true)}</span></div>${rows.map(x=>{const p=person(x.session.personId);if(!p)return '';return `<div class="history-row"><div class="identity">${avatar(p,true)}<div><div class="person-name">${esc(p.name)}</div><div class="person-sub">${x.isStart?'Sessão iniciada':'Continuação do dia anterior'}</div></div></div><div class="time">${fmtTime(x.from)}</div><div class="time">${x.to===dateFromKey(addDays(x.date,1)).getTime()?'00:00':fmtTime(x.to)}</div><div class="duration">${fmtDuration(x.ms,true)}</div><button class="btn btn-small btn-icon btn-ghost" title="Excluir a sessão completa" data-action="delete-session" data-id="${esc(x.session.id)}">${ICON('trash')}</button></div>`}).join('')}</div>`).join(''):`${empty('Nenhum registro encontrado','Faça uma contagem e finalize o cronômetro para que o registro apareça aqui.')}`}
+    ${groups.size?[...groups.entries()].map(([date,rows])=>`<div class="history-day panel" style="box-shadow:none;padding:0"><div class="history-header"><div><h3>${esc(dateLabel(date,true))}</h3><span>${rows.reduce((acc,r)=>acc+(r.isStart?1:0),0)} ${rows.filter(r=>r.isStart).length===1?'uso iniciado':'usos iniciados'} no dia</span></div><span class="tag gray">${fmtDuration(rows.reduce((acc,r)=>acc+r.ms,0),true)}</span></div>${rows.map(x=>{const p=person(x.session.personId);if(!p)return '';return `<div class="history-row"><div class="identity">${avatar(p,true)}<div><div class="person-name">${esc(p.name)}</div><div class="person-sub">${x.isStart?'Sessão iniciada':'Continuação do dia anterior'} · Início: ${esc(actorName(x.session.startedBy))} · Fim: ${esc(actorName(x.session.endedBy))}</div></div></div><div class="time">${fmtTime(x.from)}</div><div class="time">${x.to===dateFromKey(addDays(x.date,1)).getTime()?'00:00':fmtTime(x.to)}</div><div class="duration">${fmtDuration(x.ms,true)}</div><button class="btn btn-small btn-icon btn-ghost" title="Excluir a sessão completa" data-action="delete-session" data-id="${esc(x.session.id)}">${ICON('trash')}</button></div>`}).join('')}</div>`).join(''):`${empty('Nenhum registro encontrado','Faça uma contagem e finalize o cronômetro para que o registro apareça aqui.')}`}
     ${selected.length>300?'<p class="hint">Exibindo os 300 registros mais recentes. Use os filtros para localizar períodos específicos.</p>':''}</div><div class="note-card">${ICON('info')} O horário e a duração são registrados automaticamente. Se uma sessão atravessar a meia-noite, ela aparecerá nos dois dias, mas será contada como uma única visita.</div>`}
   function reportView(){const r=period(),d=summarize(r.from,r.to),ranksTime=[...d.people].sort((a,b)=>b.ms-a.ms),ranksVisits=[...d.people].sort((a,b)=>b.visits-a.visits),daily=d.days.length>31?d.days.slice(-31):d.days;const bestHour=d.hours.some(Boolean)?d.hours.indexOf(Math.max(...d.hours)):null;const weekday=['Domingo','Segunda-feira','Terça-feira','Quarta-feira','Quinta-feira','Sexta-feira','Sábado'];const bestDay=d.week.some(Boolean)?weekday[d.week.indexOf(Math.max(...d.week))]:'—';const champ=ranksTime.find(x=>x.ms>0);return `<div class="page-head"><div><h1>Relatórios e métricas</h1><p class="page-sub">Entenda a frequência, a duração e a distribuição dos registros.</p></div><button class="btn" data-action="export-csv">${ICON('download')} Exportar CSV</button></div>
    <div class="filters"><select class="field field-select" id="report-range"><option value="today" ${range==='today'?'selected':''}>Hoje</option><option value="7" ${range==='7'?'selected':''}>Últimos 7 dias</option><option value="30" ${range==='30'?'selected':''}>Últimos 30 dias</option><option value="month" ${range==='month'?'selected':''}>Este mês</option><option value="all" ${range==='all'?'selected':''}>Todo o histórico</option><option value="custom" ${range==='custom'?'selected':''}>Personalizado</option></select>${range==='custom'?`<input class="field" type="date" id="report-from" value="${esc(r.from)}" aria-label="Data inicial"><input class="field" type="date" id="report-to" value="${esc(r.to)}" aria-label="Data final">`:''}<span class="filters-end">${esc(dateLabel(r.from))} até ${esc(dateLabel(r.to))}</span></div>
@@ -175,19 +227,19 @@
   function render(){const name={overview:'Visão geral',people:'Pessoas',history:'Histórico',reports:'Relatórios'}[tab];$('#breadcrumb').textContent=name;$('#today-label').textContent=new Date().toLocaleDateString('pt-BR',{day:'2-digit',month:'short',year:'numeric'});$('#nav-people-count').textContent=store.people.length;document.querySelectorAll('.nav-btn').forEach(el=>{el.classList.toggle('active',el.dataset.tab===tab);el.setAttribute('aria-current',el.dataset.tab===tab?'page':'false')});$('#content').innerHTML=({overview,people:peopleView,history:historyView,reports:reportView})[tab]();tick();renderModal()}
   function tick(){const active=openSessions();const lookup=new Map(active.map(x=>[x.personId,x]));document.querySelectorAll('[data-timer-person]').forEach(el=>{const s=lookup.get(el.dataset.timerPerson);if(s)el.textContent=fmtTimer(Date.now()-s.startAt)})}
   function renderModal(){const root=$('#modal-root');if(!modal){root.innerHTML='';return}if(modal.type==='add'||modal.type==='edit'){const p=modal.type==='edit'?person(modal.id):null;root.innerHTML=`<div class="modal-backdrop" data-close-backdrop><div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div class="dialog-head"><h2 id="modal-title">${p?'Editar pessoa':'Cadastrar pessoa'}</h2><button class="btn btn-ghost btn-icon" data-action="close" aria-label="Fechar">${ICON('close')}</button></div><form id="form-person"><div class="form-group"><label class="form-label" for="person-name">Nome da pessoa</label><input autofocus class="form-input" id="person-name" name="name" maxlength="100" autocomplete="off" placeholder="Ex.: Maria Silva" value="${p?esc(p.name):''}" required></div><div class="form-group"><label class="form-label" for="person-color">Cor do perfil</label><input id="person-color" name="color" type="color" value="${p?esc(p.color):COLORS[store.people.length%COLORS.length]}" style="height:42px;width:70px;padding:3px;border:1px solid #e1e7ef;border-radius:9px;background:white"></div><p class="hint">Cada pessoa terá um histórico próprio de contagens e duração por dia.</p><div class="form-actions"><button type="button" class="btn" data-action="close">Cancelar</button><button type="submit" class="btn btn-primary">${p?'Salvar alterações':'Cadastrar'}</button></div></form></div></div>`;$('#person-name').focus();return}
-    if(modal.type==='profile'){const p=person(modal.id);if(!p){modal=null;root.innerHTML='';return}const sessions=cleanSessions().filter(x=>x.personId===p.id);const active=activeSession(p.id);const all=sessions.reduce((a,s)=>a+s.endAt-s.startAt,0),m=summarize(range14().from,range14().to,p.id);const byDay=new Map();for(const s of sessions)for(const part of parts(s)){const v=byDay.get(part.date)||{ms:0,visits:0};v.ms+=part.ms;if(part.isStart)v.visits++;byDay.set(part.date,v)};const grouped=[...byDay.entries()].sort((a,b)=>b[0].localeCompare(a[0]));root.innerHTML=`<div class="drawer-root"><div class="drawer-mask" data-action="close"></div><aside class="drawer" role="dialog" aria-modal="true" aria-label="Perfil de ${esc(p.name)}"><div class="flex-spread"><span class="tag">Perfil individual</span><button class="btn btn-icon btn-ghost" data-action="close" title="Fechar">${ICON('close')}</button></div><div class="profile-header">${avatar(p)}<div style="min-width:0"><h2>${esc(p.name)}</h2><span class="muted" style="font-size:11px">Cadastrado em ${dateLabel(fmtDateKey(p.createdAt))}</span></div></div>${active?`<div style="background:#153d3a;border-radius:13px;padding:13px 16px;display:flex;justify-content:space-between;align-items:center;gap:12px"><div><b style="color:#7ae9d1">Contagem ativa</b><div class="person-clock" data-timer-person="${esc(p.id)}">${fmtTimer(Date.now()-active.startAt)}</div></div><button class="btn btn-stop btn-small" data-action="stop" data-id="${esc(p.id)}">${ICON('square')} Parar</button></div>`:`<button class="btn btn-success" data-action="start" data-id="${esc(p.id)}" style="width:100%">${ICON('play')} Iniciar contagem</button>`}<div class="report-summary" style="grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:20px"><div class="mini-stat" style="padding:12px"><label>Usos</label><b>${sessions.length}</b></div><div class="mini-stat" style="padding:12px"><label>Tempo total</label><b style="font-size:17px">${fmtDuration(all,true)}</b></div><div class="mini-stat" style="padding:12px"><label>Média</label><b style="font-size:17px">${fmtDuration(sessions.length?all/sessions.length:0,true)}</b></div></div><div class="profile-section"><h3>Últimos 14 dias</h3>${buildChart(m.days.map(x=>({label:dateFromKey(x.date).toLocaleDateString('pt-BR',{day:'2-digit'}),value:x.visits})),v=>String(v))}</div><div class="profile-section"><h3>Histórico por dia</h3>${grouped.length?grouped.slice(0,12).map(([day,x])=>`<div class="profile-day"><div>${esc(dateLabel(day,true))}<small>${x.visits} ${x.visits===1?'uso iniciado':'usos iniciados'}</small></div><strong>${fmtDuration(x.ms,true)}</strong></div>`).join(''):'<p class="hint">Nenhuma contagem encerrada para esta pessoa.</p>'}</div><div class="profile-section"><h3>Últimas sessões</h3>${sessions.slice(0,10).map(s=>`<div class="profile-session"><span>${esc(fmtDateKey(s.startAt).split('-').reverse().join('/'))}</span><span>${fmtTime(s.startAt)}–${fmtTime(s.endAt)}</span><b>${fmtDuration(s.endAt-s.startAt,true)}</b><button class="btn btn-small btn-ghost" data-action="delete-session" data-id="${esc(s.id)}" title="Excluir contagem">${ICON('trash')}</button></div>`).join('')||'<p class="hint">Sem registros.</p>'}</div><div class="profile-section flex-spread"><button class="btn" data-action="edit" data-id="${esc(p.id)}">${ICON('pencil')} Editar perfil</button><button class="btn btn-danger" data-action="delete-person" data-id="${esc(p.id)}">${ICON('trash')} Excluir pessoa</button></div></aside></div>`;tick()}
+    if(modal.type==='profile'){const p=person(modal.id);if(!p){modal=null;root.innerHTML='';return}const sessions=cleanSessions().filter(x=>x.personId===p.id);const active=activeSession(p.id);const all=sessions.reduce((a,s)=>a+s.endAt-s.startAt,0),m=summarize(range14().from,range14().to,p.id);const byDay=new Map();for(const s of sessions)for(const part of parts(s)){const v=byDay.get(part.date)||{ms:0,visits:0};v.ms+=part.ms;if(part.isStart)v.visits++;byDay.set(part.date,v)};const grouped=[...byDay.entries()].sort((a,b)=>b[0].localeCompare(a[0]));root.innerHTML=`<div class="drawer-root"><div class="drawer-mask" data-action="close"></div><aside class="drawer" role="dialog" aria-modal="true" aria-label="Perfil de ${esc(p.name)}"><div class="flex-spread"><span class="tag">Perfil individual</span><button class="btn btn-icon btn-ghost" data-action="close" title="Fechar">${ICON('close')}</button></div><div class="profile-header">${avatar(p)}<div style="min-width:0"><h2>${esc(p.name)}</h2><span class="muted" style="font-size:11px">Cadastrado em ${dateLabel(fmtDateKey(p.createdAt))}</span></div></div>${active?`<div style="background:#153d3a;border-radius:13px;padding:13px 16px;display:flex;justify-content:space-between;align-items:center;gap:12px"><div><b style="color:#7ae9d1">Contagem ativa</b><div class="person-clock" data-timer-person="${esc(p.id)}">${fmtTimer(Date.now()-active.startAt)}</div></div><button class="btn btn-stop btn-small" data-action="stop" data-id="${esc(p.id)}">${ICON('square')} Parar</button></div>`:`<button class="btn btn-success" data-action="start" data-id="${esc(p.id)}" style="width:100%">${ICON('play')} Iniciar contagem</button>`}<div class="report-summary" style="grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:20px"><div class="mini-stat" style="padding:12px"><label>Usos</label><b>${sessions.length}</b></div><div class="mini-stat" style="padding:12px"><label>Tempo total</label><b style="font-size:17px">${fmtDuration(all,true)}</b></div><div class="mini-stat" style="padding:12px"><label>Média</label><b style="font-size:17px">${fmtDuration(sessions.length?all/sessions.length:0,true)}</b></div></div><div class="profile-section"><h3>Últimos 14 dias</h3>${buildChart(m.days.map(x=>({label:dateFromKey(x.date).toLocaleDateString('pt-BR',{day:'2-digit'}),value:x.visits})),v=>String(v))}</div><div class="profile-section"><h3>Histórico por dia</h3>${grouped.length?grouped.slice(0,12).map(([day,x])=>`<div class="profile-day"><div>${esc(dateLabel(day,true))}<small>${x.visits} ${x.visits===1?'uso iniciado':'usos iniciados'}</small></div><strong>${fmtDuration(x.ms,true)}</strong></div>`).join(''):'<p class="hint">Nenhuma contagem encerrada para esta pessoa.</p>'}</div><div class="profile-section"><h3>Últimas sessões</h3>${sessions.slice(0,10).map(s=>`<div class="profile-session"><span>${esc(fmtDateKey(s.startAt).split('-').reverse().join('/'))}</span><span title="Início: ${esc(actorName(s.startedBy))} | Fim: ${esc(actorName(s.endedBy))}">${fmtTime(s.startAt)}–${fmtTime(s.endAt)}</span><b>${fmtDuration(s.endAt-s.startAt,true)}</b><button class="btn btn-small btn-ghost" data-action="delete-session" data-id="${esc(s.id)}" title="Excluir contagem">${ICON('trash')}</button></div>`).join('')||'<p class="hint">Sem registros.</p>'}</div><div class="profile-section flex-spread"><button class="btn" data-action="edit" data-id="${esc(p.id)}">${ICON('pencil')} Editar perfil</button><button class="btn btn-danger" data-action="delete-person" data-id="${esc(p.id)}">${ICON('trash')} Excluir pessoa</button></div></aside></div>`;tick()}
   }
   function toast(message){const el=document.createElement('div');el.className='toast';el.textContent=message;$('#toast-wrap').appendChild(el);setTimeout(()=>el.remove(),3600)}
   async function start(id){
     const p=person(id);if(!p)return toast('Pessoa não encontrada.');
     if(activeSession(id))return toast('Essa pessoa já possui uma contagem ativa.');
-    await mutate(async()=>{const {error}=await sb.from('bathroom_sessions').insert({person_id:id});if(error)throw error;},`Contagem iniciada para ${p.name}.`);
+    await mutate(async()=>{const {error}=await sb.from('bathroom_sessions').insert({owner_id:p.ownerId,person_id:id});if(error)throw error;},`Contagem iniciada para ${p.name}.`);
   }
   async function stop(id){
     const s=activeSession(id);if(!s)return toast('Nenhuma contagem ativa.');
     const ms=Math.max(Date.now(),s.startAt+1000);
     await mutate(async()=>{
-      const {data,error}=await sb.from('bathroom_sessions').update({ended_at:new Date(ms).toISOString()}).eq('id',s.id).is('ended_at',null).select('id');
+      const {data,error}=await sb.from('bathroom_sessions').update({ended_at:new Date(ms).toISOString(),ended_by:currentUser.id}).eq('id',s.id).is('ended_at',null).select('id');
       if(error)throw error;
       if(!data?.length)throw new Error('A sessão já foi encerrada em outro dispositivo.');
     },`Contagem encerrada: ${fmtDuration(ms-s.startAt)}.`);
@@ -206,7 +258,7 @@
   function download(blob,name){const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),2000)}
   function exportJSON(){download(new Blob([JSON.stringify({format:'pausa-v1',exportedAt:new Date().toISOString(),people:store.people,sessions:store.sessions},null,2)],{type:'application/json'}),`pausa-backup-${startToday()}.json`);toast('Backup exportado. Guarde-o em local seguro.')}
   function csvValue(v){const s=String(v??'');return '"'+s.replace(/"/g,'""')+'"'}
-  function exportCSV(){const heading=['Pessoa','Início (data e hora)','Fim (data e hora)','Data de início','Duração (minutos)','Duração (segundos)','Status'];const rows=store.sessions.map(s=>{const p=person(s.personId);const delta=(s.endAt??Date.now())-s.startAt;return [p?.name||'Pessoa removida',fmtDateTime(s.startAt),s.endAt?fmtDateTime(s.endAt):'',fmtDateKey(s.startAt).split('-').reverse().join('/'),(delta/60000).toFixed(2).replace('.',','),Math.floor(delta/1000),s.endAt?'Encerrada':'Em andamento']});download(new Blob(['\uFEFF'+[heading,...rows].map(r=>r.map(csvValue).join(';')).join('\r\n')],{type:'text/csv;charset=utf-8'}),`pausa-registros-${startToday()}.csv`);toast('Relatório CSV exportado.')}
+  function exportCSV(){const heading=['Pessoa','Início (data e hora)','Fim (data e hora)','Data de início','Duração (minutos)','Duração (segundos)','Status','Iniciado por','Encerrado por'];const rows=store.sessions.map(s=>{const p=person(s.personId);const delta=(s.endAt??Date.now())-s.startAt;return [p?.name||'Pessoa removida',fmtDateTime(s.startAt),s.endAt?fmtDateTime(s.endAt):'',fmtDateKey(s.startAt).split('-').reverse().join('/'),(delta/60000).toFixed(2).replace('.',','),Math.floor(delta/1000),s.endAt?'Encerrada':'Em andamento',actorName(s.startedBy),actorName(s.endedBy)]});download(new Blob(['\uFEFF'+[heading,...rows].map(r=>r.map(csvValue).join(';')).join('\r\n')],{type:'text/csv;charset=utf-8'}),`pausa-registros-${startToday()}.csv`);toast('Relatório CSV exportado.')}
   document.addEventListener('click',e=>{
     const nav=e.target.closest('[data-tab]');if(nav){tab=nav.dataset.tab;modal=null;window.scrollTo(0,0);render();return}
     const btn=e.target.closest('[data-action]');if(btn){const action=btn.dataset.action,id=btn.dataset.id;switch(action){case 'add':modal={type:'add'};break;case 'profile':modal={type:'profile',id};break;case 'edit':modal={type:'edit',id};break;case 'close':modal=null;break;case 'start':start(id);return;case 'stop':stop(id);return;case 'delete-session':deleteSession(id);return;case 'delete-person':deletePerson(id);return;case 'export-json':exportJSON();return;case 'export-csv':exportCSV();return;case 'clear-history':historyDate='';historyPerson='all';render();return}renderModal();return}
@@ -241,6 +293,7 @@
     const {error}=await sb.auth.signOut();if(error)toast(errorMessage(error));else viewSignedOut();
   });
   $('#btn-refresh').addEventListener('click',()=>refreshData());
+  $('#btn-noaccess-signout').addEventListener('click',async()=>{const {error}=await sb.auth.signOut();if(error)toast(errorMessage(error));else viewSignedOut();});
   document.addEventListener('input',e=>{if(e.target.id==='search-people'){const el=e.target,at=el.selectionStart;searchPeople=el.value;const scroll=window.scrollY;$('#content').innerHTML=peopleView();const fresh=$('#search-people');fresh.focus();fresh.setSelectionRange(at,at);window.scrollTo(0,scroll);tick()}});
   document.addEventListener('change',e=>{const el=e.target;if(el.id==='history-date'){historyDate=el.value;render()}if(el.id==='history-person'){historyPerson=el.value;render()}if(el.id==='report-range'){range=el.value;if(range==='custom'){const current=period();customFrom=current.from;customTo=current.to}render()}if(el.id==='report-from'){customFrom=el.value;render()}if(el.id==='report-to'){customTo=el.value;render()}});
   document.addEventListener('keydown',e=>{if(e.key==='Escape'&&modal){modal=null;renderModal()}});

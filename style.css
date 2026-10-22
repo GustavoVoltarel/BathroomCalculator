@@ -250,3 +250,8 @@ input[type=date]{color-scheme:dark}
 .auth-card a{color:#c0b1ff}
 @media(max-width:750px){.account-pill{max-width:120px}.topbar{align-items:flex-start}.top-actions{gap:6px}}
 @media(max-width:490px){.account-pill{display:none}.sync-status{display:none}}
+
+/* Acesso de equipe, somente contas autorizadas */
+#auth-noaccess{margin-top:14px}
+#auth-noaccess p{margin:10px 0 14px;color:var(--muted,#b5c1d9)}
+#auth-noaccess button{max-width:220px}
